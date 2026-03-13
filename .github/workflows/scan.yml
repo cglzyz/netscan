@@ -1,33 +1,96 @@
 name: External Port Scan
 
 on:
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch: # 允许手动点击运行
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # 使用 GitHub 提供的免费 Ubuntu 服务器
+    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # 也顺便升级到 v4
 
       - name: Install nmap
-        run: sudo apt-get update && sudo apt-get install -y nmap
-
-      - name: Run Port Scan
         run: |
-          TARGET_IP="<YOUR_PUBLIC_IP>"  # <--- 在这里填入你的公网 IP
-          echo "Starting scan on $TARGET_IP..."
-          # 扫描 100 到 20000 端口，-T4 加快速度，-Pn 跳过Ping检测(防止防火墙禁Ping导致误判)
-          nmap -p 100-20000 -T4 -Pn -oN result.txt $TARGET_IP
+          sudo apt-get update
+          sudo apt-get install -y nmap
+
+      - name: Run Smart Port Scan
+        run: |
+          # ================= 配置区域 =================
+          TARGET_IP="YOUR_PUBLIC_IP_HERE"  # <--- 务必修改这里为你的公网 IP
+          START_PORT=100
+          END_PORT=20000
+          # ===========================================
+
+          if [ "$TARGET_IP" == "YOUR_PUBLIC_IP_HERE" ]; then
+            echo "::error::错误：请先编辑 yml 文件，将 TARGET_IP 替换为你的真实公网 IP！"
+            exit 1
+          fi
+
+          echo "🚀 开始扫描目标: $TARGET_IP (端口 $START_PORT - $END_PORT)"
           
-          echo "--- Scan Result ---"
-          cat result.txt
+          # 创建一个临时文件记录关闭的端口
+          CLOSED_PORTS_FILE="closed_ports.txt"
+          touch $CLOSED_PORTS_FILE
           
-          # 将结果保存为 Artifact 供下载
-          echo "Uploading results..."
-      
-      - name: Upload Result
-        uses: actions/upload-artifact@v3
+          ALL_OPEN=true
+
+          # 使用 nmap 进行扫描
+          echo "正在执行 Nmap 扫描..."
+          # -oG 输出便于 grep 处理，-T4 加速，-Pn 跳过 Ping (防止防火墙禁Ping导致误判)
+          nmap -p $START_PORT-$END_PORT -T4 -Pn -oG nmap_output.txt $TARGET_IP
+
+          # 解析 nmap 输出 (grep 状态为 closed 或 filtered 的端口)
+          echo "正在分析结果..."
+          
+          # 提取所有非 open 的端口 (closed 或 filtered)
+          # 注意：如果 nmap 输出格式有变，可能需要调整正则，但标准 oG 格式通常稳定
+          grep -oP '\d+/(?:closed|filtered)/tcp' nmap_output.txt | cut -d'/' -f1 > $CLOSED_PORTS_FILE || true
+          
+          COUNT_CLOSED=$(wc -l < $CLOSED_PORTS_FILE)
+
+          echo "----------------------------------------"
+          if [ "$COUNT_CLOSED" -eq 0 ]; then
+              echo "✅ 惊人！所有端口 ($START_PORT-$END_PORT) 均显示为 OPEN！"
+              echo "📝 保存全开报告..."
+              echo "扫描时间: $(date)" > full_open_report.txt
+              echo "目标 IP: $TARGET_IP" >> full_open_report.txt
+              echo "结果: 所有端口已激活" >> full_open_report.txt
+              cat nmap_output.txt >> full_open_report.txt
+              echo "报告已保存为 full_open_report.txt"
+          else
+              echo "⚠️ 发现 $COUNT_CLOSED 个未激活 (Closed/Filtered) 的端口。"
+              echo "📋 未激活端口列表 (前 50 个):"
+              head -n 50 $CLOSED_PORTS_FILE
+              if [ "$COUNT_CLOSED" -gt 50 ]; then
+                  echo "... 还有 $((COUNT_CLOSED - 50)) 个端口未列出，详见附件。"
+              fi
+              
+              # 生成详细报告
+              echo "扫描时间: $(date)" > detailed_report.txt
+              echo "目标 IP: $TARGET_IP" >> detailed_report.txt
+              echo "总未激活端口数: $COUNT_CLOSED" >> detailed_report.txt
+              echo "----------------------------------------" >> detailed_report.txt
+              echo "未激活端口详情:" >> detailed_report.txt
+              cat $CLOSED_PORTS_FILE >> detailed_report.txt
+              echo "----------------------------------------" >> detailed_report.txt
+              echo "完整 Nmap 输出:" >> detailed_report.txt
+              cat nmap_output.txt >> detailed_report.txt
+              
+              echo "📝 详细报告已保存为 detailed_report.txt"
+          fi
+          echo "----------------------------------------"
+
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v4  # <--- 这里已修复为 v4
         with:
-          name: scan-result
-          path: result.txt
+          name: port-scan-results
+          # 上传所有可能生成的报告文件
+          path: |
+            nmap_output.txt
+            closed_ports.txt
+            full_open_report.txt
+            detailed_report.txt
+          retention-days: 5
