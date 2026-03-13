@@ -1,6 +1,5 @@
-name: Dynamic Port Scan with Loops
+name: Smart Loop Scan (Optimized Speed & Exclude)
 
-# 关键部分：确保 on 下面的结构完全正确
 on:
   workflow_dispatch:
     inputs:
@@ -19,15 +18,26 @@ on:
       loop_count:
         description: '循环扫描次数'
         required: true
-        default: '1'
+        default: '3'
         type: choice
         options:
           - '1'
           - '2'
           - '3'
           - '5'
+          - '8'
           - '10'
-          - '20'
+      scan_delay:
+        description: '扫描延迟 (每探针间隔时间，越低越快)'
+        required: true
+        default: '200ms'
+        type: choice
+        options:
+          - '100ms' # 较快，适合内网或响应快的目标
+          - '200ms' # 推荐：平衡速度与准确性
+          - '300ms' # 稍慢，更稳妥
+          - '500ms' # 慢，适合网络极差的情况
+          - '1s'    # 极慢，仅用于极度敏感目标
 
 jobs:
   scan:
@@ -42,72 +52,177 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nmap
 
-      - name: Run Loop Scan
+      - name: Run Smart Loop Scan
         run: |
           TARGET_IP="${{ github.event.inputs.target_ip }}"
           START_PORT="${{ github.event.inputs.start_port }}"
           END_PORT="${{ github.event.inputs.end_port }}"
           LOOP_COUNT="${{ github.event.inputs.loop_count }}"
-
-          echo "📥 任务配置: IP=$TARGET_IP, 端口=$START_PORT-$END_PORT, 循环=$LOOP_COUNT"
+          SCAN_DELAY="${{ github.event.inputs.scan_delay }}"
           
+          # 初始化排除列表文件
+          EXCLUDED_PORTS_FILE="excluded_ports.txt"
+          touch $EXCLUDED_PORTS_FILE
+          
+          echo "📥 任务配置:"
+          echo "   目标 IP: $TARGET_IP"
+          echo "   端口范围: $START_PORT - $END_PORT"
+          echo "   循环次数: $LOOP_COUNT"
+          echo "   扫描延迟: $SCAN_DELAY (优化后的速度)"
+          
+          # 自动检测 IP 版本
           IP_VERSION_FLAG=""
           if [[ "$TARGET_IP" == *":"* ]]; then
-              echo "🌐 检测到 IPv6"
+              echo "🌐 检测到 IPv6 地址"
               IP_VERSION_FLAG="-6"
           else
-              echo "🌐 检测到 IPv4"
+              echo "🌐 检测到 IPv4 地址"
               IP_VERSION_FLAG="-4"
           fi
 
           SUMMARY_FILE="scan_summary.txt"
-          echo "扫描总结报告" > $SUMMARY_FILE
+          echo "智能扫描总结报告" > $SUMMARY_FILE
           echo "生成时间: $(date)" >> $SUMMARY_FILE
           echo "目标 IP: $TARGET_IP" >> $SUMMARY_FILE
+          echo "扫描延迟: $SCAN_DELAY" >> $SUMMARY_FILE
           echo "========================================" >> $SUMMARY_FILE
 
           for ((i=1; i<=LOOP_COUNT; i++)); do
+              echo ""
               echo "🔄 [第 $i / $LOOP_COUNT 次] 开始扫描..."
-              echo "--- 第 $i 次 ---" >> $SUMMARY_FILE
-
+              
               CURRENT_OUTPUT="nmap_run_${i}.txt"
               CURRENT_CLOSED="closed_ports_run_${i}.txt"
-
-              nmap $IP_VERSION_FLAG -p $START_PORT-$END_PORT -T4 -Pn -oG $CURRENT_OUTPUT $TARGET_IP
+              CURRENT_OPEN="open_ports_run_${i}.txt"
               
+              # 构建排除参数
+              EXCLUDE_ARG=""
+              if [ -s "$EXCLUDED_PORTS_FILE" ]; then
+                  COUNT_EXCLUDED=$(wc -l < "$EXCLUDED_PORTS_FILE")
+                  echo "⏭️  发现 $COUNT_EXCLUDED 个已确认开放的端口，将在本次扫描中排除..."
+                  
+                  # 将换行符转换为逗号，并去除末尾逗号
+                  EXCLUDE_LIST=$(cat $EXCLUDED_PORTS_FILE | tr '\n' ',' | sed 's/,$//')
+                  EXCLUDE_ARG="--exclude-ports $EXCLUDE_LIST"
+                  
+                  # 简单检查参数长度 (可选，通常不需要，因为 Linux 支持很长的参数字符串)
+                  LEN=${#EXCLUDE_ARG}
+                  if [ $LEN -gt 100000 ]; then
+                      echo "::warning::排除列表非常长 ($LEN 字符)，但 Nmap 通常能处理。"
+                  fi
+              else
+                  echo "ℹ️  暂无排除端口，进行全量扫描。"
+              fi
+
+              echo "--- 第 $i 次 ---" >> $SUMMARY_FILE
+              echo ">>> 开始时间: $(date)" >> $SUMMARY_FILE
+
+              # 执行 Nmap
+              # --scan-delay: 用户选择的延迟 (如 200ms)
+              # --max-retries 2: 减少重试，依靠延迟来保证准确性
+              echo "正在执行 Nmap (延迟: $SCAN_DELAY)..."
+              
+              nmap $IP_VERSION_FLAG \
+                   -T3 \
+                   --scan-delay $SCAN_DELAY \
+                   --max-retries 2 \
+                   -p $START_PORT-$END_PORT \
+                   $EXCLUDE_ARG \
+                   -Pn \
+                   -oG $CURRENT_OUTPUT \
+                   $TARGET_IP
+
+              NMAP_STATUS=$?
+              
+              if [ $NMAP_STATUS -ne 0 ]; then
+                  echo "::warning::第 $i 次扫描 Nmap 返回非零状态码 ($NMAP_STATUS)。"
+                  echo ">>> 状态码: $NMAP_STATUS" >> $SUMMARY_FILE
+              fi
+
+              # 提取本次的开放端口
+              grep -oP '\d+/open/tcp' $CURRENT_OUTPUT | cut -d'/' -f1 > $CURRENT_OPEN || true
+              
+              # 提取本次的关闭/过滤端口
               grep -oP '\d+/(?:closed|filtered)/tcp' $CURRENT_OUTPUT | cut -d'/' -f1 > $CURRENT_CLOSED || true
-              COUNT_CLOSED=$(wc -l < $CURRENT_CLOSED)
-              TOTAL_FOUND=$(grep -cE '(open|closed|filtered)/tcp' $CURRENT_OUTPUT || echo 0)
-
-              echo "✅ 第 $i 次完成。未激活端口: $COUNT_CLOSED"
-              echo "结果: $COUNT_CLOSED 个未激活端口" >> $SUMMARY_FILE
               
+              COUNT_OPEN=$(wc -l < $CURRENT_OPEN)
+              COUNT_CLOSED=$(wc -l < $CURRENT_CLOSED)
+              TOTAL_FOUND=$((COUNT_OPEN + COUNT_CLOSED))
+
+              echo "✅ 第 $i 次扫描完成。"
+              echo "   - 新发现开放端口: $COUNT_OPEN"
+              echo "   - 未激活/过滤端口: $COUNT_CLOSED"
+              
+              # 更新排除列表
+              if [ -s "$CURRENT_OPEN" ]; then
+                  cat $CURRENT_OPEN >> $EXCLUDED_PORTS_FILE
+                  sort -nu $EXCLUDED_PORTS_FILE -o $EXCLUDED_PORTS_FILE
+                  TOTAL_EXCLUDED=$(wc -l < $EXCLUDED_PORTS_FILE)
+                  echo "   📚 累计已排除的开放端口总数: $TOTAL_EXCLUDED"
+              else
+                  TOTAL_EXCLUDED=$(wc -l < $EXCLUDED_PORTS_FILE)
+              fi
+
+              # 记录到总结文件
+              echo ">>> 结束时间: $(date)" >> $SUMMARY_FILE
+              echo ">>> 结果: 开放=$COUNT_OPEN, 未激活=$COUNT_CLOSED, 累计排除=$TOTAL_EXCLUDED" >> $SUMMARY_FILE
+              
+              if [ "$TOTAL_FOUND" -eq 0 ] && [ "$i" -eq 1 ]; then
+                  echo "   ⚠️ 警告：首轮扫描未发现任何端口状态。"
+                  echo "   状态: ⚠️ 无数据" >> $SUMMARY_FILE
+              elif [ "$COUNT_OPEN" -eq 0 ] && [ "$TOTAL_EXCLUDED" -eq 0 ]; then
+                  echo "   🔒 本轮未发现新的开放端口。"
+                  echo "   状态: 🔒 无新开放" >> $SUMMARY_FILE
+              else
+                  echo "   🎯 扫描有效。"
+                  echo "   状态: ✅ 正常" >> $SUMMARY_FILE
+              fi
+              
+              # 生成最终报告
               if [ "$i" -eq "$LOOP_COUNT" ]; then
+                  echo ""
+                  echo "🏁 所有循环结束，生成最终报告..."
+                  
                   FINAL_REPORT="final_detailed_report.txt"
                   {
-                    echo "=== 最终报告 ==="
+                    echo "=== 最终详细报告 ==="
                     echo "目标: $TARGET_IP"
                     echo "日期: $(date)"
                     echo "总循环: $LOOP_COUNT"
+                    echo "扫描延迟: $SCAN_DELAY"
                     echo ""
-                    echo "--- 最后一次扫描详情 ---"
+                    echo "=== 统计摘要 ==="
+                    echo "累计确认开放端口数: $TOTAL_EXCLUDED"
+                    echo "最后一次扫描未激活端口数: $COUNT_CLOSED"
+                    echo ""
+                    echo "=== 确认开放的端口列表 (共 $TOTAL_EXCLUDED 个) ==="
+                    cat $EXCLUDED_PORTS_FILE
+                    echo ""
+                    echo "=== 最后一次扫描的未激活/过滤端口 (前 100 个) ==="
+                    head -n 100 $CURRENT_CLOSED
+                    if [ "$COUNT_CLOSED" -gt 100 ]; then
+                        echo "... (还有 $((COUNT_CLOSED - 100)) 个未列出)"
+                    fi
+                    echo ""
+                    echo "=== 最后一次扫描的完整 Nmap 输出 ==="
                     cat $CURRENT_OUTPUT
-                    echo ""
-                    echo "--- 未激活端口列表 ---"
-                    cat $CURRENT_CLOSED
                   } > $FINAL_REPORT
               fi
           done
           
+          echo ""
+          echo "📊 扫描总结:"
           cat $SUMMARY_FILE
 
       - name: Upload All Results
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-loop-${{ github.run_id }}
+          name: smart-scan-results-${{ github.run_id }}
           path: |
             scan_summary.txt
             final_detailed_report.txt
+            excluded_ports.txt
             nmap_run_*.txt
             closed_ports_run_*.txt
-          retention-days: 5
+            open_ports_run_*.txt
+          retention-days: 7
