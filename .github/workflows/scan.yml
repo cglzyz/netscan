@@ -1,7 +1,113 @@
-name: Test Workflow
-on: workflow_dispatch
+name: Dynamic Port Scan with Loops
+
+# 关键部分：确保 on 下面的结构完全正确
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: '目标 IP 地址 (支持 IPv4 或 IPv6)'
+        required: true
+        default: '1.2.3.4'
+      start_port:
+        description: '起始端口'
+        required: true
+        default: '100'
+      end_port:
+        description: '结束端口'
+        required: true
+        default: '20000'
+      loop_count:
+        description: '循环扫描次数'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+          - '10'
+          - '20'
+
 jobs:
-  test:
+  scan:
     runs-on: ubuntu-latest
+    
     steps:
-      - run: echo "Hello"
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install nmap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nmap
+
+      - name: Run Loop Scan
+        run: |
+          TARGET_IP="${{ github.event.inputs.target_ip }}"
+          START_PORT="${{ github.event.inputs.start_port }}"
+          END_PORT="${{ github.event.inputs.end_port }}"
+          LOOP_COUNT="${{ github.event.inputs.loop_count }}"
+
+          echo "📥 任务配置: IP=$TARGET_IP, 端口=$START_PORT-$END_PORT, 循环=$LOOP_COUNT"
+          
+          IP_VERSION_FLAG=""
+          if [[ "$TARGET_IP" == *":"* ]]; then
+              echo "🌐 检测到 IPv6"
+              IP_VERSION_FLAG="-6"
+          else
+              echo "🌐 检测到 IPv4"
+              IP_VERSION_FLAG="-4"
+          fi
+
+          SUMMARY_FILE="scan_summary.txt"
+          echo "扫描总结报告" > $SUMMARY_FILE
+          echo "生成时间: $(date)" >> $SUMMARY_FILE
+          echo "目标 IP: $TARGET_IP" >> $SUMMARY_FILE
+          echo "========================================" >> $SUMMARY_FILE
+
+          for ((i=1; i<=LOOP_COUNT; i++)); do
+              echo "🔄 [第 $i / $LOOP_COUNT 次] 开始扫描..."
+              echo "--- 第 $i 次 ---" >> $SUMMARY_FILE
+
+              CURRENT_OUTPUT="nmap_run_${i}.txt"
+              CURRENT_CLOSED="closed_ports_run_${i}.txt"
+
+              nmap $IP_VERSION_FLAG -p $START_PORT-$END_PORT -T4 -Pn -oG $CURRENT_OUTPUT $TARGET_IP
+              
+              grep -oP '\d+/(?:closed|filtered)/tcp' $CURRENT_OUTPUT | cut -d'/' -f1 > $CURRENT_CLOSED || true
+              COUNT_CLOSED=$(wc -l < $CURRENT_CLOSED)
+              TOTAL_FOUND=$(grep -cE '(open|closed|filtered)/tcp' $CURRENT_OUTPUT || echo 0)
+
+              echo "✅ 第 $i 次完成。未激活端口: $COUNT_CLOSED"
+              echo "结果: $COUNT_CLOSED 个未激活端口" >> $SUMMARY_FILE
+              
+              if [ "$i" -eq "$LOOP_COUNT" ]; then
+                  FINAL_REPORT="final_detailed_report.txt"
+                  {
+                    echo "=== 最终报告 ==="
+                    echo "目标: $TARGET_IP"
+                    echo "日期: $(date)"
+                    echo "总循环: $LOOP_COUNT"
+                    echo ""
+                    echo "--- 最后一次扫描详情 ---"
+                    cat $CURRENT_OUTPUT
+                    echo ""
+                    echo "--- 未激活端口列表 ---"
+                    cat $CURRENT_CLOSED
+                  } > $FINAL_REPORT
+              fi
+          done
+          
+          cat $SUMMARY_FILE
+
+      - name: Upload All Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-loop-${{ github.run_id }}
+          path: |
+            scan_summary.txt
+            final_detailed_report.txt
+            nmap_run_*.txt
+            closed_ports_run_*.txt
+          retention-days: 5
