@@ -1,0 +1,33 @@
+name: External Port Scan
+
+on:
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install nmap
+        run: sudo apt-get update && sudo apt-get install -y nmap
+
+      - name: Run Port Scan
+        run: |
+          TARGET_IP="<YOUR_PUBLIC_IP>"  # <--- 在这里填入你的公网 IP
+          echo "Starting scan on $TARGET_IP..."
+          # 扫描 100 到 20000 端口，-T4 加快速度，-Pn 跳过Ping检测(防止防火墙禁Ping导致误判)
+          nmap -p 100-20000 -T4 -Pn -oN result.txt $TARGET_IP
+          
+          echo "--- Scan Result ---"
+          cat result.txt
+          
+          # 将结果保存为 Artifact 供下载
+          echo "Uploading results..."
+      
+      - name: Upload Result
+        uses: actions/upload-artifact@v3
+        with:
+          name: scan-result
+          path: result.txt
