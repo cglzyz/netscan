@@ -19,7 +19,7 @@ jobs:
       - name: Run Smart Port Scan
         run: |
           # ================= 配置区域 =================
-          TARGET_IP="YOUR_PUBLIC_IP_HERE"  # <--- 务必修改这里为你的公网 IP
+          TARGET_IP="115.62.61.242"  # <--- 务必修改这里为你的公网 IP
           START_PORT=100
           END_PORT=20000
           # ===========================================
